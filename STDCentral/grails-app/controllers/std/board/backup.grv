@@ -1,0 +1,330 @@
+package std.board
+
+import std.defect.*
+import org.springframework.dao.DataIntegrityViolationException
+import org.apache.commons.collections.ListUtils
+import org.apache.commons.collections.FactoryUtils
+
+class StoryController {
+
+    static allowedMethods = [save: "POST", update: "POST", delete: "POST"]
+    def storyService
+
+    def index() {
+        redirect(action: "list", params: params)
+    }
+
+    def list() {
+        params.max = Math.min(params.max ? params.int('max') : 10, 100)
+        def storyList = params?.build ? Story.createCriteria().list(params) {
+            eq("build", params.build)
+        } : Story.list(params)
+
+        [storyInstanceList: storyList, storyInstanceTotal: storyList.totalCount]
+    }
+
+    def listByBuild() {
+        def build = params.build ?: 0
+
+        def storyList = Story.createCriteria().list() {
+            createAlias "functionalArea", "f"
+            eq("build", build as Integer)
+            state {
+                ne('name', 'Cancelled')
+            }
+            order "f.name"
+            order "priority"
+            order "id"
+        }
+
+        def buildNumbers = Story.retrieveAllBuildNumbers()
+
+        def totalEstimate = storyList*.totalHourEstimate()?.sum() ?: 0
+
+        [storyInstanceList: storyList, totalEstimate: totalEstimate, buildNumbers: buildNumbers]
+    }
+
+    def listByUser() {
+        def build = params.build ?: 0
+
+        def storyList = Story.createCriteria().list() {
+            createAlias "assignedTo", "u"
+            if (params?.assignedTo?.id)
+                eq("u.id", params.assignedTo.id)
+
+            order "u.first_name"
+            order "build"
+            order "priority"
+            order "id"
+        }.groupBy{it.assignedTo}
+
+        def users = User.list()
+
+        def totalEstimate = storyList*.totalHourEstimate()?.sum() ?: 0
+
+        [storyInstanceList: storyList, totalEstimate: totalEstimate, buildNumbers: buildNumbers]
+    }
+
+    def listByState() {
+        def build = params.build ?: 0
+
+        def storyList = Story.createCriteria().list() {
+            createAlias "functionalArea", "f"
+            createAlias "state", "s"
+            eq("build", build as Integer)
+            if (params?.state?.id) {
+                eq("s.id", params?.state?.id as Long)
+            }
+            order "s.sortOrder"
+            order "f.name"
+            order "priority"
+            order "id"
+        }.groupBy{it.functionalArea}
+
+        def themeList = Theme.createCriteria().list() {
+            createAlias "functionalArea", "f"
+            eq("build", build as Integer)
+        }.groupBy{it.functionalArea}
+
+        def buildNumbers = Story.retrieveAllBuildNumbers()
+
+        [storyInstanceList: storyList, buildNumbers: buildNumbers, themeList: themeList]
+    }
+
+    def storyReport() {
+        def build = params.build ?: 0
+
+        def storyList = Story.createCriteria().list() {
+            createAlias "functionalArea", "f"
+            createAlias "state", "s"
+            //eq("build", build as Integer) //list all builds in report
+            if (params?.state?.id) {
+                eq("s.id", params?.state?.id as Long)
+            }
+            if (params?.area) {
+                eq('f.id', params.area as Long)
+            }
+            order "phase"
+            order "build"
+            order "s.sortOrder"
+            order "f.name"
+            order "priority"
+            order "id"
+        }.groupBy{it.functionalArea}
+
+        def themeList = Theme.createCriteria().list() {
+            createAlias "functionalArea", "f"
+            eq("build", build as Integer)
+        }.groupBy{it.functionalArea}
+
+        def buildNumbers = Story.retrieveAllBuildNumbers()
+
+        def grandTotalsMap = [:]
+ //       def totalsMap = [:]
+
+        EstimateType.each { type ->
+
+/*            totalsMap["$type"] = Estimate.createCriteria().list() {
+                eq("type", type)
+                if (params?.area) {
+                    story {
+                        functionalArea {
+                            eq("id", params.area as Long)
+                        }
+                    }
+                }
+            }*.calculateAmountByType(EstimateAmountType.HOURS).sum() ?: 0
+*/
+            grandTotalsMap["$type"] = Estimate.findAllByType(type)*.calculateAmountByType(EstimateAmountType.HOURS).sum() ?: 0
+        }
+
+        def sum = 0
+        grandTotalsMap.each { key, value ->
+            sum = sum + value
+        }
+        grandTotalsMap["All"] = sum
+
+/*        sum = 0
+        totalsMap.each { key, value ->
+            sum = sum + value
+        }
+        totalsMap["All"] = sum
+*/
+        withFormat {
+            html {
+            }
+            xls {
+                // set our header and content type
+                response.setHeader("Content-disposition", "inline; filename=builds.xls")
+                response.contentType = "application/vnd.ms-excel"
+            }
+        }
+
+
+        render view:"storyReport", model:[storyInstanceList: storyList,
+                    buildNumbers: buildNumbers, themeList: themeList,
+//                    totalsMap: totalsMap,
+                    grandTotalsMap: grandTotalsMap]
+
+    }
+
+    def pdfListByState() {
+        def build = params.build ?: 0
+
+        def storyList = Story.createCriteria().list() {
+            createAlias "functionalArea", "f"
+            createAlias "state", "s"
+            eq("build", build as Integer)
+            if (params?.state?.id) {
+                eq("s.id", params?.state?.id as Long)
+            }
+            order "s.sortOrder"
+            order "f.name"
+            order "priority"
+            order "id"
+        }.groupBy{it.functionalArea}
+
+        def themeList = Theme.createCriteria().list() {
+            createAlias "functionalArea", "f"
+            eq("build", build as Integer)
+        }.groupBy{it.functionalArea}
+
+        def buildNumbers = Story.retrieveAllBuildNumbers()
+
+        renderPdf filename: "Build_${build}.pdf", template: "/story/pdfListByState", model:[storyInstanceList: storyList, buildNumbers: buildNumbers, themeList: themeList]
+    }
+
+    def create() {
+        [storyInstance: new Story(params.story)]
+    }
+
+    def save(StoryCmd cmd) {
+
+        def storyInstance = storyService.saveOrUpdateStory(params, cmd)
+
+        if (storyInstance.hasErrors()) {
+            render(view: "create", model: [storyInstance: storyInstance])
+            return
+        }
+
+		flash.message = message(code: 'default.created.message', args: [message(code: 'story.label', default: 'Story'), storyInstance.id])
+        redirect(action: "show", id: storyInstance.id)
+    }
+
+    def show() {
+        def storyInstance = Story.get(params.id)
+        if (!storyInstance) {
+			flash.message = message(code: 'default.not.found.message', args: [message(code: 'story.label', default: 'Story'), params.id])
+            redirect(action: "list")
+            return
+        }
+
+        [storyInstance: storyInstance]
+    }
+
+    def edit() {
+        def storyInstance = Story.get(params.id)
+        if (!storyInstance) {
+            flash.message = message(code: 'default.not.found.message', args: [message(code: 'story.label', default: 'Story'), params.id])
+            redirect(action: "list")
+            return
+        }
+
+        [storyInstance: storyInstance]
+    }
+
+    def update(StoryCmd cmd) {
+        // def storyInstance = Story.get(params?.id)
+
+        // if (!storyInstance) {
+        //     flash.message = message(code: 'default.not.found.message', args: [message(code: 'story.label', default: 'Story'), params.id])
+        //     redirect(action: "list")
+        //     return
+        // }
+
+        // if (params.version) {
+        //     def version = params.version.toLong()
+        //     if (storyInstance.version > version) {
+        //         storyInstance.errors.rejectValue("version", "default.optimistic.locking.failure",
+        //                   [message(code: 'story.label', default: 'Story')] as Object[],
+        //                   "Another user has updated this Story while you were editing")
+        //         render(view: "edit", model: [storyInstance: storyInstance])
+        //         return
+        //     }
+        // }
+
+        def storyInstance = storyService.saveOrUpdateStory(params, cmd)
+
+        println "after service: " + storyInstance.functionalArea
+
+        if (storyInstance.hasErrors()) {
+            render(view: "edit", model: [storyInstance: storyInstance])
+            return
+        }
+
+		flash.message = message(code: 'default.updated.message', args: [message(code: 'story.label', default: 'Story'), storyInstance.id])
+        redirect(action: "show", id: storyInstance.id)
+    }
+
+    def updateAssignedTo() {
+
+        def storyInstance = Story.get(params.id)
+        def assignedTo = User.findById(params?.story?.assignedTo?.id)
+
+        if (!storyInstance) {
+            render "not saved"
+            return
+        }
+
+        storyInstance.assignedTo = assignedTo
+        if (storyInstance.save())
+            render "updated"
+        else
+            render "error"
+    }
+
+    def delete() {
+        def storyInstance = Story.get(params.id)
+        if (!storyInstance) {
+			flash.message = message(code: 'default.not.found.message', args: [message(code: 'story.label', default: 'Story'), params.id])
+            redirect(action: "list")
+            return
+        }
+
+        try {
+            storyInstance.delete(flush: true)
+			flash.message = message(code: 'default.deleted.message', args: [message(code: 'story.label', default: 'Story'), params.id])
+            redirect(action: "list")
+        }
+        catch (DataIntegrityViolationException e) {
+			flash.message = message(code: 'default.not.deleted.message', args: [message(code: 'story.label', default: 'Story'), params.id])
+            redirect(action: "show", id: params.id)
+        }
+    }
+}
+
+
+class StoryCmd {
+    StoryInstanceCmd story = new StoryInstanceCmd()
+
+    String toString() {
+        "${story} ${estimates.collect{it}}"
+    }
+}
+
+class StoryInstanceCmd {
+    def id
+    String statement
+    BoardState state //backlog, dev, test, complete, etc.
+    Priority priority
+    FunctionalArea functionalArea
+    String topic
+    Story epic
+    Integer build
+    Integer phase
+    User assignedTo
+
+    String toString() {
+        "${id}: $functionalArea/$topic ${statement.substring(0,[statement.size(), 30].min())} in $phase.$build"
+    }
+}
